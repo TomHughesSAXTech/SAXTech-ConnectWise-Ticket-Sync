@@ -304,3 +304,195 @@ def sync_tickets(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype='application/json'
         )
+
+
+@app.route(route="ping", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def ping(req: func.HttpRequest) -> func.HttpResponse:
+    """Health check endpoint"""
+    return func.HttpResponse(
+        json.dumps({'ok': True, 'time': datetime.utcnow().isoformat() + '+00:00'}),
+        status_code=200,
+        mimetype='application/json'
+    )
+
+
+@app.timer_trigger(schedule="0 0 */6 * * *", arg_name="timer", run_on_startup=False)
+def sync_tickets_timer(timer: func.TimerRequest) -> None:
+    """Timer-triggered sync that runs every 6 hours"""
+    logging.info('Timer trigger: ConnectWise Ticket Sync started')
+    
+    # Get sync configuration from environment
+    sync_mode = os.getenv('TIMER_SYNC_MODE', 'incremental')
+    incremental_days = int(os.getenv('INCREMENTAL_DAYS', '80'))
+    backfill_until = os.getenv('BACKFILL_UNTIL_UTC', None)
+    
+    if sync_mode == 'incremental':
+        days_ago = incremental_days
+    else:
+        days_ago = 240
+    
+    target_since = (datetime.utcnow() - timedelta(days=days_ago)).date()
+    target_until = datetime.utcnow().date()
+    
+    # If backfill date is set, use it
+    if backfill_until:
+        try:
+            backfill_dt = datetime.fromisoformat(backfill_until.replace('Z', '+00:00'))
+            target_since = backfill_dt.date()
+            logging.info(f'Using backfill date: {target_since}')
+        except Exception as e:
+            logging.warning(f'Could not parse BACKFILL_UNTIL_UTC: {e}')
+    
+    logging.info(f'Timer sync mode: {sync_mode.upper()}, days: {days_ago}')
+    logging.info(f'Date range: {target_since} through {target_until}')
+
+    all_documents = []
+    deleted_ticket_ids = []
+    total_tickets_processed = 0
+    skipped_tickets = 0
+
+    try:
+        for board in CONNECTWISE_BOARDS:
+            logging.info(f'Processing board: {board}')
+
+            next_day = target_until + timedelta(days=1)
+            filter_str = f"board/name='{board}' and closedDate >= [{target_since}] and closedDate < [{next_day}]"
+            page_size = 250
+            page = 1
+
+            while True:
+                uri = f'{API_BASE_URL}/service/tickets?conditions={requests.utils.quote(filter_str)}&pageSize={page_size}&page={page}'
+                response = requests.get(uri, headers=cw_headers)
+                tickets = response.json()
+
+                if not tickets:
+                    break
+
+                page += 1
+
+                for ticket in tickets:
+                    ticket_id = ticket['id']
+                    summary = ticket['summary']
+                    contact = ticket.get('contact', {}).get('name', 'Unknown')
+                    closed_date = datetime.fromisoformat(ticket['closedDate'].replace('Z', '+00:00'))
+                    formatted_closed_date = closed_date.isoformat()
+                    status = ticket.get('status', {}).get('name', 'Unknown')
+                    
+                    last_updated = ticket.get('_info', {}).get('lastUpdated', ticket['closedDate'])
+                    last_updated_dt = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
+                    
+                    try:
+                        existing_paged = search_client.search(
+                            search_text='*',
+                            filter=f"ticketNumber eq '{ticket_id}'",
+                            select=['closedDate'],
+                            top=1
+                        )
+                        existing_doc = next(iter(existing_paged), None)
+                        
+                        if existing_doc and existing_doc.get('closedDate'):
+                            existing_date = datetime.fromisoformat(str(existing_doc['closedDate']).replace('Z', '+00:00'))
+                            if last_updated_dt <= existing_date:
+                                skipped_tickets += 1
+                                logging.info(f'Skipping Ticket #{ticket_id} - no changes since last sync')
+                                continue
+                    except Exception as e:
+                        logging.warning(f'Could not check existing ticket #{ticket_id}: {e}')
+                    
+                    total_tickets_processed += 1
+                    logging.info(f'Processing Ticket #{ticket_id} (Status: {status})')
+
+                    if 'closed' not in status.lower() and 'completed' not in status.lower():
+                        logging.info(f'Ticket #{ticket_id} is not closed, marking for deletion')
+                        deleted_ticket_ids.append(ticket_id)
+                        continue
+
+                    notes_uri = f'{API_BASE_URL}/service/tickets/{ticket_id}/allnotes'
+                    notes_response = requests.get(notes_uri, headers=cw_headers)
+                    notes = notes_response.json()
+
+                    if not notes:
+                        continue
+
+                    valid_notes = [n for n in notes if n.get('text', '').strip()]
+                    if not valid_notes:
+                        continue
+
+                    sorted_notes = sorted(valid_notes, key=lambda n: n['_info']['dateEntered'])
+                    oldest_note = sorted_notes[0]
+                    remaining_notes = sorted_notes[1:]
+
+                    problem_text = f"{summary}\n{oldest_note['text']}"
+                    resolution_text = '\n'.join([n['text'] for n in remaining_notes])
+
+                    description_prompt = 'You are an IT support summarizer. Based ONLY on the provided ticket summary and first note, rephrase them into a clear, professional description of the problem. Focus on what the user\'s issue is. DO NOT suggest any solutions, actions, or troubleshooting.'
+                    resolution_prompt = 'You are an IT support summarizer. Based ONLY on the later notes, summarize any actions taken or resolutions provided. Keep it factual, neutral, and professional. DO NOT suggest additional troubleshooting or make assumptions beyond what is stated.'
+
+                    ai_description = query_openai(description_prompt, problem_text)
+                    ai_resolution = query_openai(resolution_prompt, resolution_text) if resolution_text else 'No additional notes found.'
+
+                    combined_text = f'Problem: {ai_description}\n\nResolution: {ai_resolution}'
+                    embedding_vector = get_embedding(combined_text)
+
+                    max_chunk_length = 2000
+                    chunks = []
+
+                    if len(combined_text) <= max_chunk_length:
+                        chunks.append({'chunkId': 0, 'content': combined_text})
+                    else:
+                        chunk_count = (len(combined_text) + max_chunk_length - 1) // max_chunk_length
+                        for i in range(chunk_count):
+                            start_index = i * max_chunk_length
+                            chunk_content = combined_text[start_index:start_index + max_chunk_length]
+                            chunks.append({'chunkId': i, 'content': chunk_content})
+
+                    for chunk in chunks:
+                        document_id = f'{ticket_id}-{chunk["chunkId"]}'
+                        all_documents.append({
+                            'id': document_id,
+                            'ticketNumber': str(ticket_id),
+                            'contact': contact,
+                            'closedDate': formatted_closed_date,
+                            'problemSummary': ai_description,
+                            'resolutionSummary': ai_resolution,
+                            'chunkId': chunk['chunkId'],
+                            'content': chunk['content'],
+                            'contentVector': embedding_vector
+                        })
+                    
+                    time.sleep(1)
+
+                if len(tickets) < page_size:
+                    break
+
+        logging.info(f'Total tickets processed: {total_tickets_processed}')
+        logging.info(f'Tickets skipped (unchanged): {skipped_tickets}')
+        logging.info(f'Total documents to upload: {len(all_documents)}')
+        logging.info(f'Tickets to delete: {len(deleted_ticket_ids)}')
+
+        if deleted_ticket_ids:
+            logging.info('Deleting documents for reopened/deleted tickets')
+            for ticket_id in deleted_ticket_ids:
+                search_results = search_client.search(
+                    search_text='*',
+                    filter=f"ticketNumber eq '{ticket_id}'",
+                    select=['id']
+                )
+                delete_ids = [result['id'] for result in search_results]
+                if delete_ids:
+                    search_client.delete_documents(documents=[{'id': doc_id} for doc_id in delete_ids])
+                    logging.info(f'Deleted {len(delete_ids)} documents for ticket #{ticket_id}')
+
+        if all_documents:
+            logging.info('Uploading documents to Azure Search')
+            batch_size = 1000
+            for i in range(0, len(all_documents), batch_size):
+                batch = all_documents[i:i + batch_size]
+                search_client.merge_or_upload_documents(documents=batch)
+                logging.info(f'Uploaded batch {i // batch_size + 1} ({len(batch)} documents)')
+
+        logging.info('Timer sync completed successfully')
+
+    except Exception as e:
+        logging.error(f'Timer sync error: {e}', exc_info=True)
+        raise
