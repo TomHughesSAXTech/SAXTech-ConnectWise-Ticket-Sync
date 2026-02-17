@@ -21,7 +21,7 @@ PUBLIC_KEY = 'Uxpk3ZrgmsAaAxxB'
 PRIVATE_KEY = 'A9mQomscT5Pf1Aue'
 CLIENT_ID = '4b9e4159-581e-494e-98f0-fc6af0f5a424'
 API_BASE_URL = 'https://api-na.myconnectwise.net/v4_6_release/apis/3.0'
-CONNECTWISE_BOARDS = ['Parsippany Service Desk', 'Managed Services']
+CONNECTWISE_BOARDS = ['Managed Services']
 
 SEARCH_SERVICE_NAME = 'saxmegamind-search'
 SEARCH_INDEX_NAME = 'connectwise-tickets'
