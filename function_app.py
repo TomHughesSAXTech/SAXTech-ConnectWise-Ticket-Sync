@@ -350,6 +350,7 @@ def sync_tickets_timer(timer: func.TimerRequest) -> None:
     deleted_ticket_ids = []
     total_tickets_processed = 0
     skipped_tickets = 0
+    total_uploaded = 0
 
     try:
         for board in CONNECTWISE_BOARDS:
@@ -460,38 +461,25 @@ def sync_tickets_timer(timer: func.TimerRequest) -> None:
                             'contentVector': embedding_vector
                         })
                     
+                    # Upload in small batches to avoid timeout losing all work
+                    if len(all_documents) >= 10:
+                        logging.info(f'Uploading batch of {len(all_documents)} documents...')
+                        search_client.merge_or_upload_documents(documents=all_documents)
+                        total_uploaded += len(all_documents)
+                        all_documents = []
+                    
                     time.sleep(1)
 
                 if len(tickets) < page_size:
                     break
 
-        logging.info(f'Total tickets processed: {total_tickets_processed}')
-        logging.info(f'Tickets skipped (unchanged): {skipped_tickets}')
-        logging.info(f'Total documents to upload: {len(all_documents)}')
-        logging.info(f'Tickets to delete: {len(deleted_ticket_ids)}')
-
-        if deleted_ticket_ids:
-            logging.info('Deleting documents for reopened/deleted tickets')
-            for ticket_id in deleted_ticket_ids:
-                search_results = search_client.search(
-                    search_text='*',
-                    filter=f"ticketNumber eq '{ticket_id}'",
-                    select=['id']
-                )
-                delete_ids = [result['id'] for result in search_results]
-                if delete_ids:
-                    search_client.delete_documents(documents=[{'id': doc_id} for doc_id in delete_ids])
-                    logging.info(f'Deleted {len(delete_ids)} documents for ticket #{ticket_id}')
-
+        # Upload any remaining documents
         if all_documents:
-            logging.info('Uploading documents to Azure Search')
-            batch_size = 1000
-            for i in range(0, len(all_documents), batch_size):
-                batch = all_documents[i:i + batch_size]
-                search_client.merge_or_upload_documents(documents=batch)
-                logging.info(f'Uploaded batch {i // batch_size + 1} ({len(batch)} documents)')
+            logging.info(f'Uploading final batch of {len(all_documents)} documents...')
+            search_client.merge_or_upload_documents(documents=all_documents)
+            total_uploaded += len(all_documents)
 
-        logging.info('Timer sync completed successfully')
+        logging.info(f'Timer sync completed: {total_tickets_processed} processed, {skipped_tickets} skipped, {total_uploaded} uploaded')
 
     except Exception as e:
         logging.error(f'Timer sync error: {e}', exc_info=True)
