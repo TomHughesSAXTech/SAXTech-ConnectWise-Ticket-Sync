@@ -53,7 +53,7 @@ def query_openai(prompt: str, user_text: str, max_retries: int = 5) -> str:
                     {'role': 'system', 'content': prompt},
                     {'role': 'user', 'content': user_text}
                 ]},
-                timeout=30
+                timeout=60
             )
             response.raise_for_status()
             result = response.json()
@@ -62,9 +62,17 @@ def query_openai(prompt: str, user_text: str, max_retries: int = 5) -> str:
             else:
                 logging.error(f'OpenAI API response missing choices: {result}')
                 raise ValueError(f'Invalid OpenAI response: {result}')
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 5
+                logging.warning(f'Connection error, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries}): {e}')
+                time.sleep(wait_time)
+            else:
+                logging.error(f'OpenAI connection failed after {max_retries} attempts: {e}')
+                raise
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429 and attempt < max_retries - 1:
-                wait_time = (2 ** attempt) + 1  # Exponential backoff: 1s, 3s, 5s, 9s, 17s
+                wait_time = (2 ** attempt) * 5
                 logging.warning(f'Rate limit hit, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})')
                 time.sleep(wait_time)
             else:
@@ -74,6 +82,29 @@ def query_openai(prompt: str, user_text: str, max_retries: int = 5) -> str:
             logging.error(f'OpenAI API error: {e}')
             raise
 
+def cw_api_get(uri: str, max_retries: int = 5) -> requests.Response:
+    import time
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(uri, headers=cw_headers, timeout=60)
+            response.raise_for_status()
+            return response
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 5
+                logging.warning(f'CW API connection error, retrying in {wait_time}s: {e}')
+                time.sleep(wait_time)
+            else:
+                logging.error(f'CW API connection failed after {max_retries} attempts: {e}')
+                raise
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429 and attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 5
+                logging.warning(f'CW rate limit, retrying in {wait_time}s')
+                time.sleep(wait_time)
+            else:
+                raise
+
 def get_embedding(text: str, max_retries: int = 5) -> list:
     import time
     for attempt in range(max_retries):
@@ -82,7 +113,7 @@ def get_embedding(text: str, max_retries: int = 5) -> list:
                 EMBEDDING_API_URL,
                 headers={'api-key': OPENAI_API_KEY, 'Content-Type': 'application/json'},
                 json={'input': text},
-                timeout=30
+                timeout=60
             )
             response.raise_for_status()
             result = response.json()
@@ -91,10 +122,18 @@ def get_embedding(text: str, max_retries: int = 5) -> list:
             else:
                 logging.error(f'Embedding API response: {result}')
                 raise ValueError(f'Invalid embedding response: {result}')
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 5
+                logging.warning(f'Embedding connection error, retrying in {wait_time}s: {e}')
+                time.sleep(wait_time)
+            else:
+                logging.error(f'Embedding connection failed after {max_retries} attempts: {e}')
+                raise
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429 and attempt < max_retries - 1:
-                wait_time = (2 ** attempt) + 1
-                logging.warning(f'Embedding rate limit hit, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})')
+                wait_time = (2 ** attempt) * 5
+                logging.warning(f'Embedding rate limit hit, retrying in {wait_time}s')
                 time.sleep(wait_time)
             else:
                 logging.error(f'Embedding API error: {e}')
@@ -136,7 +175,7 @@ def sync_tickets(req: func.HttpRequest) -> func.HttpResponse:
 
             while True:
                 uri = f'{API_BASE_URL}/service/tickets?conditions={requests.utils.quote(filter_str)}&pageSize={page_size}&page={page}'
-                response = requests.get(uri, headers=cw_headers)
+                response = cw_api_get(uri)
                 tickets = response.json()
 
                 if not tickets:
@@ -190,7 +229,7 @@ def sync_tickets(req: func.HttpRequest) -> func.HttpResponse:
                         continue
 
                     notes_uri = f'{API_BASE_URL}/service/tickets/{ticket_id}/allnotes'
-                    notes_response = requests.get(notes_uri, headers=cw_headers)
+                    notes_response = cw_api_get(notes_uri)
                     notes = notes_response.json()
 
                     if not notes:
@@ -363,7 +402,7 @@ def sync_tickets_timer(timer: func.TimerRequest) -> None:
 
             while True:
                 uri = f'{API_BASE_URL}/service/tickets?conditions={requests.utils.quote(filter_str)}&pageSize={page_size}&page={page}'
-                response = requests.get(uri, headers=cw_headers)
+                response = cw_api_get(uri)
                 tickets = response.json()
 
                 if not tickets:
@@ -409,7 +448,7 @@ def sync_tickets_timer(timer: func.TimerRequest) -> None:
                         continue
 
                     notes_uri = f'{API_BASE_URL}/service/tickets/{ticket_id}/allnotes'
-                    notes_response = requests.get(notes_uri, headers=cw_headers)
+                    notes_response = cw_api_get(notes_uri)
                     notes = notes_response.json()
 
                     if not notes:
