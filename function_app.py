@@ -355,9 +355,8 @@ def ping(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 
-@app.timer_trigger(schedule="0 0 */6 * * *", arg_name="timer", run_on_startup=False)
-def sync_tickets_timer(timer: func.TimerRequest) -> None:
-    """Timer-triggered sync that runs every 6 hours"""
+def _do_timer_sync():
+    """Shared sync logic for timer triggers"""
     logging.info('Timer trigger: ConnectWise Ticket Sync started')
     
     # Get sync configuration from environment
@@ -523,3 +522,15 @@ def sync_tickets_timer(timer: func.TimerRequest) -> None:
     except Exception as e:
         logging.error(f'Timer sync error: {e}', exc_info=True)
         raise
+
+
+@app.timer_trigger(schedule="0 0 7-18 * * *", arg_name="timer", run_on_startup=False)
+def sync_tickets_timer_business(timer: func.TimerRequest) -> None:
+    """Hourly sync during business hours (7am-6pm UTC)"""
+    _do_timer_sync()
+
+
+@app.timer_trigger(schedule="0 0 19,22,1,4 * * *", arg_name="timer", run_on_startup=False)
+def sync_tickets_timer_offhours(timer: func.TimerRequest) -> None:
+    """Every 3 hours during off-hours (7pm, 10pm, 1am, 4am UTC)"""
+    _do_timer_sync()
